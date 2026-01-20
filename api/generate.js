@@ -1,10 +1,10 @@
 import fs from "fs";
 import path from "path";
-import axios from "axios"; // We'll use axios for DeepSeek calls
+import axios from "axios";
 
 // ✅ Memory folder (works on Vercel)
 const MEMORY_DIR = "/tmp/memory";
-if (!fs.existsSync(MEMORY_DIR)) fs.mkdirSync(MEMORY_DIR);
+if (!fs.existsSync(MEMORY_DIR)) fs.mkdirSync(MEMORY_DIR, { recursive: true });
 
 // 🧠 Load user memory
 function loadMemory(userId) {
@@ -58,9 +58,11 @@ function saveMemory(userId, memory) {
 
 // 🧠 Simple heuristic to classify text language
 function detectLanguage(text) {
+  if (!text || typeof text !== 'string') return "english";
+  
   const lower = text.toLowerCase();
-  const swahiliWords = ["habari", "sasa", "niko", "kwani", "basi", "ndio", "karibu", "asante"];
-  const shengWords = ["bro", "maze", "manze", "noma", "fiti", "safi", "buda", "msee", "mwana", "poa"];
+  const swahiliWords = ["habari", "sasa", "niko", "kwani", "basi", "ndio", "karibu", "asante", "mambo", "poa", "sawa"];
+  const shengWords = ["bro", "maze", "manze", "noma", "fiti", "safi", "buda", "msee", "mwana", "poa", "vibe"];
 
   const swCount = swahiliWords.filter((w) => lower.includes(w)).length;
   const shCount = shengWords.filter((w) => lower.includes(w)).length;
@@ -70,27 +72,38 @@ function detectLanguage(text) {
   return "swahili";
 }
 
-// 🚀 Main API Handler
+// 🚀 Main Serverless Function
 export default async function handler(req, res) {
   // --- CORS setup ---
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Access-Control-Allow-Credentials", true);
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS,PATCH,DELETE,POST,PUT");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version"
+  );
 
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST")
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
-    const { prompt, project, userId } = req.body;
-    if (!prompt || !userId)
-      return res.status(400).json({ error: "Missing prompt or userId." });
+    const { prompt, project, userId = "default" } = req.body;
+    
+    if (!prompt) {
+      return res.status(400).json({ error: "Missing prompt parameter." });
+    }
 
     // 🧠 Load memory
     let memory = loadMemory(userId);
     if (project) memory.lastProject = project;
     memory.lastTask = prompt;
+    
+    // Add user message to conversation
     memory.conversation.push({ role: "user", content: prompt });
 
     // 🌍 Detect language
@@ -104,44 +117,78 @@ export default async function handler(req, res) {
       languageInstruction = "Respond in English, friendly Kenyan developer tone.";
     }
 
-    // 🧩 Build conversation context
-    const promptText = `
-${memory.conversation
-  .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
-  .join("\n")}
+    // 🔥 Prepare messages for DeepSeek API
+    // Add language instruction to system message
+    const messages = [...memory.conversation];
+    if (messages[0]?.role === "system") {
+      messages[0].content += `\n\n${languageInstruction}`;
+    }
 
-System instruction: ${languageInstruction}
-`;
-
-    // 🔥 Call DeepSeek API
+    // 🔥 Call DeepSeek API (updated to use chat completions format)
     const deepSeekResponse = await axios.post(
-      "https://api.deepseek.com/v1/chat", // Replace with actual DeepSeek endpoint if different
+      "https://api.deepseek.com/chat/completions",
       {
-        prompt: promptText,
-        model: "deepseek-default", // adjust based on DeepSeek model naming
-        temperature: 0.9,
-        max_tokens: 900,
+        model: "deepseek-chat", // Use appropriate model
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 2000,
+        stream: false,
       },
       {
         headers: {
           "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
           "Content-Type": "application/json",
         },
+        timeout: 30000, // 30 second timeout
       }
     );
 
-    const fullResponse =
-      deepSeekResponse.data.reply || "⚠️ No response received.";
+    const assistantReply = deepSeekResponse.data?.choices?.[0]?.message?.content || 
+                          "⚠️ No response received from AI.";
 
-    // 🧹 Clean and save memory
-    const cleanText = fullResponse.replace(/as an ai|language model/gi, "");
+    // 🧹 Clean response and save memory
+    const cleanText = assistantReply.replace(/as an ai|language model/gi, "");
     memory.conversation.push({ role: "assistant", content: cleanText });
+    
+    // Limit conversation history to last 20 messages (including system message)
+    if (memory.conversation.length > 20) {
+      const systemMessage = memory.conversation[0];
+      const recentMessages = memory.conversation.slice(-19);
+      memory.conversation = [systemMessage, ...recentMessages];
+    }
+    
     saveMemory(userId, memory);
 
-    // ✅ Return
-    return res.status(200).json({ reply: cleanText });
-  } catch (err) {
-    console.error("💥 Backend error:", err.response?.data || err.message);
-    return res.status(500).json({ error: "Server error." });
+    // ✅ Return response
+    return res.status(200).json({ 
+      reply: cleanText,
+      memory: {
+        lastProject: memory.lastProject,
+        conversationLength: memory.conversation.length
+      }
+    });
+    
+  } catch (error) {
+    console.error("💥 Backend error:", error.response?.data || error.message);
+    
+    // Return user-friendly error message
+    let errorMessage = "Server error. Please try again.";
+    let statusCode = 500;
+    
+    if (error.response?.status === 401) {
+      errorMessage = "API key is invalid or missing.";
+      statusCode = 401;
+    } else if (error.response?.status === 429) {
+      errorMessage = "Rate limit exceeded. Please try again later.";
+      statusCode = 429;
+    } else if (error.code === 'ECONNABORTED') {
+      errorMessage = "Request timeout. Please try again.";
+      statusCode = 408;
+    }
+    
+    return res.status(statusCode).json({ 
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 }
