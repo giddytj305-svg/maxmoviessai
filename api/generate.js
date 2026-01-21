@@ -92,9 +92,7 @@ export default async function handler(req, res) {
     "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version"
   );
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   if (req.method === "GET") {
     return res.status(200).json({
@@ -154,13 +152,12 @@ export default async function handler(req, res) {
   const messages = [...memory.conversation];
   if (messages[0]?.role === "system") messages[0].content += `\n\n${languageInstruction}`;
 
-  // ✅ Check API key
   if (!process.env.DEEPSEEK_API_KEY) {
     return res.status(500).json({ error: "Server configuration error: DEEPSEEK_API_KEY not set" });
   }
 
   // Call DeepSeek API safely
-  let assistantReply = "I couldn't generate a response.";
+  let assistantReply = "";
   try {
     const deepSeekResponse = await axios.post(
       "https://api.deepseek.com/chat/completions",
@@ -168,12 +165,30 @@ export default async function handler(req, res) {
       { headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`, "Content-Type": "application/json" }, timeout: 30000 }
     );
 
-    assistantReply = deepSeekResponse.data?.choices?.[0]?.message?.content || assistantReply;
+    console.log("📦 Full DeepSeek API response:", JSON.stringify(deepSeekResponse.data, null, 2));
+
+    if (
+      deepSeekResponse.data &&
+      deepSeekResponse.data.choices &&
+      deepSeekResponse.data.choices[0] &&
+      deepSeekResponse.data.choices[0].message &&
+      deepSeekResponse.data.choices[0].message.content
+    ) {
+      assistantReply = deepSeekResponse.data.choices[0].message.content;
+    } else {
+      return res.status(502).json({ 
+        error: "DeepSeek API did not return a valid message",
+        rawResponse: deepSeekResponse.data
+      });
+    }
   } catch (err) {
-    console.warn("⚠️ DeepSeek API call failed:", err.message);
+    console.error("❌ DeepSeek API call failed:", err.response?.data || err.message);
+    return res.status(502).json({
+      error: "Failed to fetch response from DeepSeek API",
+      details: err.response?.data || err.message
+    });
   }
 
-  // Clean response and save memory
   const cleanText = assistantReply.replace(/as an ai|language model/gi, "");
   memory.conversation.push({ role: "assistant", content: cleanText });
   if (memory.conversation.length > 20) {
